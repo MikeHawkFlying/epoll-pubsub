@@ -1,0 +1,120 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r tests/requirements.txt
+
+      - name: Build
+        run: make -j"$(nproc)" release
+      - name: Tests
+        run: python -m pytest -v tests
+
+      - name: Build with AddressSanitizer + UBSan
+        run: make -j"$(nproc)" asan
+      - name: Tests under ASan + UBSan
+        env:
+          SERVER_BIN: build/asan/pubsub-server
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: python -m pytest -q tests
+
+  valgrind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r tests/requirements.txt
+      - run: sudo apt-get update && sudo apt-get install -y valgrind
+      - run: make debug
+      - name: Tests under valgrind
+        env:
+          SERVER_BIN: build/debug/pubsub-server
+          SERVER_WRAPPER: >-
+            valgrind -q --leak-check=full --show-leak-kinds=definite,indirect
+            --errors-for-leak-kinds=definite,indirect --error-exitcode=99
+          PUBSUB_TIMEOUT: "20"
+          PUBSUB_START_TIMEOUT: "60"
+        run: python -m pytest -q tests
+
+  bench:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - run: make -j"$(nproc)" release
+      - name: Benchmarks
+        run: |
+          ulimit -n 65536
+          scripts/bench.sh
+      - run: cat results/bench.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: bench-results
+          path: results/
+
+  network:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark tcpdump
+      - run: make -j"$(nproc)" release
+      - name: 5% loss + 100 ms delay (tc netem)
+        run: scripts/netem.sh
+      - name: Capture and decode with tshark
+        run: scripts/capture.sh
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### netem (5% loss, 100 ms delay)'
+            echo '```'
+            cat results/netem.txt 2>/dev/null || true
+            echo '```'
+            echo '### frames decoded by tools/pubsub.lua'
+            echo '```'
+            sort results/frame-types.txt 2>/dev/null | uniq -c | head -20 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: network-results
+          path: results/
+
+  docker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker build -t epoll-pubsub .
+      - name: Smoke test the image
+        run: |
+          docker run -d --name ps -p 7400:7400 epoll-pubsub
+          python3 scripts/smoke.py 127.0.0.1 7400
+          docker logs ps
+          docker rm -f ps
+      - run: docker image ls epoll-pubsub
